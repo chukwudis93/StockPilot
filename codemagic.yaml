@@ -1,0 +1,41 @@
+workflows:
+  android-apk:
+    name: StockPilot — Android APK
+    max_build_duration: 30
+    instance_type: linux_x2
+    environment:
+      node: 20
+      java: 17
+      vars:
+        PACKAGE_NAME: "com.stockpilot.app"
+    scripts:
+      - name: Install npm dependencies
+        script: |
+          npm install
+
+      - name: Add the Android platform (Capacitor)
+        script: |
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
+
+      - name: Copy the web app into the Android project
+        script: |
+          npx cap sync android
+
+      - name: Build the debug APK
+        script: |
+          cd android
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --stacktrace
+
+    artifacts:
+      - android/app/build/outputs/apk/debug/*.apk
+
+    publishing:
+      email:
+        recipients:
+          - your-email@example.com
+        notify:
+          success: true
+          failure: true

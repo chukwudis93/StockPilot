@@ -1,0 +1,12 @@
+{
+  "appId": "com.stockpilot.app",
+  "appName": "StockPilot",
+  "webDir": "docs",
+  "bundledWebRuntime": false,
+  "android": {
+    "allowMixedContent": true
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}
