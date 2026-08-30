@@ -68,7 +68,7 @@
       const res = await fetch('app.js');
       if (!res.ok) throw new Error('Could not fetch app.js — HTTP ' + res.status);
       const rawCode = await res.text();
-      const transformed = Babel.transform(rawCode, { presets: ['react'], filename: 'app.js' }).code;
+         const transformed = Babel.transform(rawCode, { presets: [["react", { runtime: "classic" }]], filename: 'app.js' }).code;
       const script = document.createElement('script');
       script.text = transformed;
       document.body.appendChild(script);
