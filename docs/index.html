@@ -1,6 +1,16 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<script>
+  window.addEventListener('error', function (e) {
+    var el = document.getElementById('root');
+    if (el) el.innerHTML = '<div style="padding:20px;font-family:monospace;font-size:12px;color:#B0332C;white-space:pre-wrap;">LOAD ERROR:\n' + (e.message || 'unknown') + '\nFile: ' + (e.filename || '?') + '\nLine: ' + (e.lineno || '?') + '</div>';
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    var el = document.getElementById('root');
+    if (el) el.innerHTML = '<div style="padding:20px;font-family:monospace;font-size:12px;color:#B0332C;white-space:pre-wrap;">PROMISE ERROR:\n' + (e.reason && e.reason.message ? e.reason.message : JSON.stringify(e.reason)) + '</div>';
+  });
+</script>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="theme-color" content="#2F5FE0" />
