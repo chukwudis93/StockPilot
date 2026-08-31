@@ -1,4 +1,4 @@
-const { useState, useEffect, useRef } = React;
+const { useState, useEffect, useRef, useMemo } = React;
 
 // ============================================================
 // Firebase — shared data (shops: categories, items, reps, activity)
@@ -134,6 +134,16 @@ function pruneHistory(shop) {
 function defaultShop(name) {
   return { id: uid(), name, historyRetentionDays: 90, categories: [], reps: [], activityLog: [], createdAt: now() };
 }
+
+// Appends one activity-log entry to a shop object. Used INSIDE the same
+// updateShop() call that also changes stock, so the quantity change and its
+// log entry are written together, atomically — never as two separate writes.
+function withActivity(shop, action, details, who) {
+  return { ...shop, activityLog: [{ id: uid(), ts: now(), actingAs: who, action, details }, ...(shop.activityLog || [])] };
+}
+
+const DEFAULT_PERMS = { canStockIn: true, canStockOut: true };
+const repPerms = (rep) => rep?.permissions || DEFAULT_PERMS;
 
 // Local, offline category-suggestion templates — used whenever no API key is set,
 // or if a live AI call fails. Keeps "AI Setup" useful with zero network dependency.
@@ -329,8 +339,6 @@ function App() {
   const [showResellerAuth, setShowResellerAuth] = useState(false);
   const [showApiKeyModal, setShowApiKeyModal] = useState(false);
   const [syncStatus, setSyncStatus] = useState("connecting"); // connecting | live | local-only | offline
-  const shopsRef = useRef([]);
-  useEffect(() => { shopsRef.current = shops || []; }, [shops]);
 
   function setActiveShopId(id) {
     setActiveShopIdState(id);
@@ -389,12 +397,6 @@ function App() {
     showToast._t = setTimeout(() => setToast(null), 2200);
   }
 
-  // Full replace of one shop's document — every other phone's listener
-  // picks this up automatically, usually within a second.
-  function saveShop(shop) {
-    if (!firebaseReady) { setShops((prev) => prev.map((s) => (s.id === shop.id ? shop : s))); return; }
-    db.collection("shops").doc(shop.id).set(shop).catch(() => showToast("Couldn't sync — will retry when back online"));
-  }
   function createShop(shop) {
     if (!firebaseReady) { setShops((prev) => [...prev, shop]); return; }
     db.collection("shops").doc(shop.id).set(shop).catch(() => showToast("Couldn't sync — will retry when back online"));
@@ -403,15 +405,32 @@ function App() {
     if (!firebaseReady) { setShops((prev) => prev.filter((s) => s.id !== id)); return; }
     db.collection("shops").doc(id).delete().catch(() => showToast("Couldn't sync — will retry when back online"));
   }
-  function updateShop(id, updater) {
-    const current = shopsRef.current.find((s) => s.id === id);
-    if (!current) return;
-    const next = pruneHistory(updater(current));
-    saveShop(next);
+  // Reads the CURRENT server document inside a transaction, applies your
+  // change on top of it, and writes it back atomically. This is what stops
+  // two near-simultaneous saves (e.g. a stock edit immediately followed by
+  // its own activity-log entry, or two different phones saving around the
+  // same moment) from overwriting each other — each transaction always
+  // starts from the true latest state, not a possibly-stale local copy.
+  async function updateShop(id, updater) {
+    if (!firebaseReady) {
+      setShops((prev) => prev.map((s) => (s.id === id ? pruneHistory(updater(s)) : s)));
+      return;
+    }
+    const ref = db.collection("shops").doc(id);
+    try {
+      await db.runTransaction(async (tx) => {
+        const snap = await tx.get(ref);
+        if (!snap.exists) return;
+        const next = pruneHistory(updater(snap.data()));
+        tx.set(ref, next);
+      });
+    } catch (e) {
+      showToast("Couldn't sync — will retry when back online");
+    }
   }
 
   function logActivity(shopId, action, details, who) {
-    updateShop(shopId, (s) => ({ ...s, activityLog: [{ id: uid(), ts: now(), actingAs: who, action, details }, ...(s.activityLog || [])] }));
+    updateShop(shopId, (s) => withActivity(s, action, details, who));
   }
 
   function loginSession(sess) {
@@ -631,6 +650,7 @@ function ResellerAuthModal({ shops, updateShop, onClose, onLoggedIn }) {
 
 function ResellerView({ shop, rep, updateShop, logActivity, onLogout, showToast }) {
   const [tab, setTab] = useState("inventory");
+  const permissions = repPerms(rep);
   const tabs = [{ id: "inventory", label: "Inventory", icon: Store }, { id: "statement", label: "Statement", icon: LayoutList }];
   return (
     <div className="min-h-screen bg-[#F5F7FA] text-[#111827] flex flex-col pb-20" style={{ fontFamily: "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
@@ -656,7 +676,7 @@ function ResellerView({ shop, rep, updateShop, logActivity, onLogout, showToast 
         <p className="text-[11px] text-[#9CA3AF] mt-2">Everything you record below is saved under your name.</p>
       </div>
       <main className="flex-1 px-4 py-4">
-        {tab === "inventory" && <InventoryTab shop={shop} updateShop={updateShop} logActivity={logActivity} actingAs={rep.name} shops={[shop]} createShop={() => {}} setActiveShopId={() => {}} showToast={showToast} hideShopSwap />}
+        {tab === "inventory" && <InventoryTab shop={shop} updateShop={updateShop} logActivity={logActivity} actingAs={rep.name} shops={[shop]} createShop={() => {}} setActiveShopId={() => {}} showToast={showToast} hideShopSwap permissions={permissions} />}
         {tab === "statement" && <StatementTab shop={shop} showToast={showToast} />}
       </main>
       <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-[#E4E7EC] flex items-stretch z-40" style={{ paddingBottom: "env(safe-area-inset-bottom)" }}>
@@ -772,7 +792,7 @@ function TopBar({ shops, activeShopId, setActiveShopId, createShop, removeShop, 
 // ============================================================
 // Inventory
 // ============================================================
-function InventoryTab({ shop, updateShop, logActivity, actingAs, shops, createShop, setActiveShopId, showToast, hideShopSwap }) {
+function InventoryTab({ shop, updateShop, logActivity, actingAs, shops, createShop, setActiveShopId, showToast, hideShopSwap, permissions }) {
   const [addCat, setAddCat] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -811,7 +831,7 @@ function InventoryTab({ shop, updateShop, logActivity, actingAs, shops, createSh
 
       <div className="space-y-3">
         {visibleCategories.map((cat) => (
-          <CategoryCard key={cat.id} shop={shop} cat={cat} updateShop={updateShop} logActivity={logActivity} actingAs={actingAs} forceExpanded={q !== ""} showToast={showToast} />
+          <CategoryCard key={cat.id} shop={shop} cat={cat} updateShop={updateShop} logActivity={logActivity} actingAs={actingAs} forceExpanded={q !== ""} showToast={showToast} permissions={permissions} />
         ))}
       </div>
 
@@ -840,7 +860,7 @@ function CategoryModal({ onClose, onSave, initial }) {
   );
 }
 
-function CategoryCard({ shop, cat, updateShop, logActivity, actingAs, forceExpanded, showToast }) {
+function CategoryCard({ shop, cat, updateShop, logActivity, actingAs, forceExpanded, showToast, permissions }) {
   const [editCat, setEditCat] = useState(false);
   const [delCat, setDelCat] = useState(false);
   const [addItem, setAddItem] = useState(false);
@@ -855,11 +875,29 @@ function CategoryCard({ shop, cat, updateShop, logActivity, actingAs, forceExpan
   const liveBinItem = binItemId ? cat.items.find((i) => i.id === binItemId) : null;
 
   function commitQty(item) {
-    const newQty = pending[item.id];
-    if (newQty === undefined || newQty === item.qty) return;
-    const diff = newQty - item.qty;
-    updateShop(shop.id, (s) => ({ ...s, categories: s.categories.map((c) => c.id !== cat.id ? c : { ...c, items: c.items.map((it) => it.id !== item.id ? it : { ...it, qty: newQty, history: [{ id: uid(), ts: now(), type: diff > 0 ? "IN" : "OUT", qtyChange: diff, newQty, actingAs, note: "Quick edit" }, ...(it.history || [])] }) }) }));
-    logActivity(shop.id, diff > 0 ? "Stock increased" : "Stock decreased", `${item.name}: ${item.qty} → ${newQty}`, actingAs);
+    const pendingVal = pending[item.id];
+    if (pendingVal === undefined || pendingVal === item.qty) return;
+    const delta = pendingVal - item.qty; // how much the user wants to add/remove
+    updateShop(shop.id, (s) => {
+      let logType = null, logMsg = null;
+      const next = {
+        ...s,
+        categories: s.categories.map((c) => {
+          if (c.id !== cat.id) return c;
+          return { ...c, items: c.items.map((it) => {
+            if (it.id !== item.id) return it;
+            const before = it.qty;
+            const newQty = Math.max(0, before + delta);
+            const actualDelta = newQty - before;
+            if (actualDelta === 0) return it;
+            logType = actualDelta > 0 ? "Stock increased" : "Stock decreased";
+            logMsg = `${item.name}: ${before} → ${newQty}`;
+            return { ...it, qty: newQty, history: [{ id: uid(), ts: now(), type: actualDelta > 0 ? "IN" : "OUT", qtyChange: actualDelta, newQty, actingAs, note: "Quick edit" }, ...(it.history || [])] };
+          }) };
+        }),
+      };
+      return logMsg ? withActivity(next, logType, logMsg, actingAs) : s;
+    });
     setPending((p) => { const n = { ...p }; delete n[item.id]; return n; });
   }
 
@@ -897,9 +935,9 @@ function CategoryCard({ shop, cat, updateShop, logActivity, actingAs, forceExpan
                     <div className="text-xs text-[#9CA3AF]">{naira(item.price)}{item.brand ? ` · ${item.brand}` : ""}</div>
                   </button>
                   <div className="flex items-center gap-1.5 bg-[#F5F7FA] rounded-full px-1 py-1 shrink-0">
-                    <button onClick={() => setPending((p) => ({ ...p, [item.id]: Math.max(0, qty - 1) }))} className="w-7 h-7 rounded-full bg-white shadow-sm flex items-center justify-center text-[#374151]"><Minus size={13} /></button>
+                    <button onClick={() => setPending((p) => ({ ...p, [item.id]: Math.max(0, qty - 1) }))} disabled={permissions && !permissions.canStockOut} className="w-7 h-7 rounded-full bg-white shadow-sm flex items-center justify-center text-[#374151] disabled:opacity-30"><Minus size={13} /></button>
                     <span className="w-7 text-center text-sm font-bold tabular-nums text-[#111827]">{qty}</span>
-                    <button onClick={() => setPending((p) => ({ ...p, [item.id]: qty + 1 }))} className="w-7 h-7 rounded-full bg-white shadow-sm flex items-center justify-center text-[#374151]"><Plus size={13} /></button>
+                    <button onClick={() => setPending((p) => ({ ...p, [item.id]: qty + 1 }))} disabled={permissions && !permissions.canStockIn} className="w-7 h-7 rounded-full bg-white shadow-sm flex items-center justify-center text-[#374151] disabled:opacity-30"><Plus size={13} /></button>
                   </div>
                   <button onClick={() => commitQty(item)} disabled={!dirty} className="w-7 h-7 rounded-full flex items-center justify-center shrink-0" style={dirty ? { background: "#1B9C4B", color: "white" } : { background: "#F1F3F6", color: "#C9CDD6" }} title="Save"><Check size={14} /></button>
                 </div>
@@ -919,7 +957,7 @@ function CategoryCard({ shop, cat, updateShop, logActivity, actingAs, forceExpan
       )}
       {editCat && <CategoryModal initial={cat} onClose={() => setEditCat(false)} onSave={(name, desc) => { updateShop(shop.id, (s) => ({ ...s, categories: s.categories.map((c) => c.id === cat.id ? { ...c, name, description: desc } : c) })); setEditCat(false); }} />}
       {delCat && <ConfirmModal title={`Delete "${cat.name}"?`} body={`This removes the category and all ${cat.items.length} item(s) inside it, including their history. This can't be undone.`} confirmLabel="Delete category" danger onConfirm={() => { updateShop(shop.id, (s) => ({ ...s, categories: s.categories.filter((c) => c.id !== cat.id) })); setDelCat(false); }} onCancel={() => setDelCat(false)} />}
-      {liveBinItem && <BinCard shop={shop} cat={cat} item={liveBinItem} updateShop={updateShop} logActivity={logActivity} actingAs={actingAs} onClose={() => setBinItemId(null)} showToast={showToast} />}
+      {liveBinItem && <BinCard shop={shop} cat={cat} item={liveBinItem} updateShop={updateShop} logActivity={logActivity} actingAs={actingAs} onClose={() => setBinItemId(null)} showToast={showToast} permissions={permissions} />}
     </div>
   );
 }
@@ -959,33 +997,53 @@ function ItemModal({ onClose, onSave }) {
 // ============================================================
 // Bin card — quantity changes commit immediately; history is downloadable
 // ============================================================
-function BinCard({ shop, cat, item, updateShop, logActivity, actingAs, onClose, showToast }) {
+function BinCard({ shop, cat, item, updateShop, logActivity, actingAs, onClose, showToast, permissions }) {
   const [price, setPrice] = useState(item.price);
   const [brand, setBrand] = useState(item.brand || "");
   const [inAmt, setInAmt] = useState("");
   const [outAmt, setOutAmt] = useState("");
   const [flash, setFlash] = useState("");
+  const canIn = !permissions || permissions.canStockIn;
+  const canOut = !permissions || permissions.canStockOut;
 
   function commitQtyChange(type, qtyChange, note) {
-    const newQty = Math.max(0, item.qty + qtyChange);
-    const actualChange = newQty - item.qty;
-    if (actualChange === 0) return;
-    updateShop(shop.id, (s) => ({ ...s, categories: s.categories.map((c) => c.id !== cat.id ? c : { ...c, items: c.items.map((it) => it.id !== item.id ? it : { ...it, qty: newQty, history: [{ id: uid(), ts: now(), type, qtyChange: actualChange, newQty, actingAs, note }, ...(it.history || [])] }) }) }));
-    logActivity(shop.id, actualChange > 0 ? "Stock increased" : "Stock decreased", `${item.name}: ${item.qty} → ${newQty}`, actingAs);
-    setFlash(actualChange > 0 ? `+${actualChange} saved` : `${actualChange} saved`);
+    if (!qtyChange) return;
+    updateShop(shop.id, (s) => {
+      let logType = null, logMsg = null;
+      const next = {
+        ...s,
+        categories: s.categories.map((c) => {
+          if (c.id !== cat.id) return c;
+          return { ...c, items: c.items.map((it) => {
+            if (it.id !== item.id) return it;
+            const before = it.qty;
+            const newQty = Math.max(0, before + qtyChange);
+            const actualChange = newQty - before;
+            if (actualChange === 0) return it;
+            logType = actualChange > 0 ? "Stock increased" : "Stock decreased";
+            logMsg = `${item.name}: ${before} → ${newQty}`;
+            return { ...it, qty: newQty, history: [{ id: uid(), ts: now(), type, qtyChange: actualChange, newQty, actingAs, note }, ...(it.history || [])] };
+          }) };
+        }),
+      };
+      return logMsg ? withActivity(next, logType, logMsg, actingAs) : s;
+    });
+    setFlash(qtyChange > 0 ? `+${qtyChange} saved` : `${qtyChange} saved`);
     clearTimeout(commitQtyChange._t);
     commitQtyChange._t = setTimeout(() => setFlash(""), 1400);
   }
-  function applyIn() { const n = Math.floor(Number(inAmt)); if (!Number.isFinite(n) || n <= 0) return; commitQtyChange("IN", n, "Restock"); setInAmt(""); }
-  function applyOut() { const n = Math.floor(Number(outAmt)); if (!Number.isFinite(n) || n <= 0) return; commitQtyChange("OUT", -n, "Sold/used"); setOutAmt(""); }
+  function applyIn() { if (!canIn) return; const n = Math.floor(Number(inAmt)); if (!Number.isFinite(n) || n <= 0) return; commitQtyChange("IN", n, "Restock"); setInAmt(""); }
+  function applyOut() { if (!canOut) return; const n = Math.floor(Number(outAmt)); if (!Number.isFinite(n) || n <= 0) return; commitQtyChange("OUT", -n, "Sold/used"); setOutAmt(""); }
 
   function saveDetails() {
     const parsedPrice = parseFloat(price) || 0;
     const priceChanged = parsedPrice !== item.price;
     const brandChanged = brand !== (item.brand || "");
     if (priceChanged || brandChanged) {
-      updateShop(shop.id, (s) => ({ ...s, categories: s.categories.map((c) => c.id !== cat.id ? c : { ...c, items: c.items.map((it) => it.id !== item.id ? it : { ...it, price: parsedPrice, brand }) }) }));
-      logActivity(shop.id, "Item details updated", `${item.name}: price ${naira(item.price)} → ${naira(parsedPrice)}`, actingAs);
+      updateShop(shop.id, (s) => {
+        const next = { ...s, categories: s.categories.map((c) => c.id !== cat.id ? c : { ...c, items: c.items.map((it) => it.id !== item.id ? it : { ...it, price: parsedPrice, brand }) }) };
+        return withActivity(next, "Item details updated", `${item.name}: price ${naira(item.price)} → ${naira(parsedPrice)}`, actingAs);
+      });
     }
     onClose();
   }
@@ -1015,31 +1073,32 @@ function BinCard({ shop, cat, item, updateShop, logActivity, actingAs, onClose, 
         <div className="bg-[#F5F7FA] rounded-xl p-3 flex items-center justify-between mb-1">
           <span className="text-sm text-[#6B7280]">Current quantity</span>
           <div className="flex items-center gap-2">
-            <button type="button" onClick={() => commitQtyChange("OUT", -1, "Manual adjustment")} className="w-8 h-8 rounded-lg bg-white border border-[#E4E7EC] flex items-center justify-center active:bg-[#F1F3F6]"><Minus size={14} /></button>
+            <button type="button" onClick={() => commitQtyChange("OUT", -1, "Manual adjustment")} disabled={!canOut} className="w-8 h-8 rounded-lg bg-white border border-[#E4E7EC] flex items-center justify-center active:bg-[#F1F3F6] disabled:opacity-30"><Minus size={14} /></button>
             <span className="w-10 text-center font-bold tabular-nums">{item.qty}</span>
-            <button type="button" onClick={() => commitQtyChange("IN", 1, "Manual adjustment")} className="w-8 h-8 rounded-lg bg-white border border-[#E4E7EC] flex items-center justify-center active:bg-[#F1F3F6]"><Plus size={14} /></button>
+            <button type="button" onClick={() => commitQtyChange("IN", 1, "Manual adjustment")} disabled={!canIn} className="w-8 h-8 rounded-lg bg-white border border-[#E4E7EC] flex items-center justify-center active:bg-[#F1F3F6] disabled:opacity-30"><Plus size={14} /></button>
           </div>
         </div>
         <div className="h-4 mb-3">{flash && <p className="text-[11px] font-semibold text-[#1B9C4B]">{flash}</p>}</div>
 
         <div className="grid grid-cols-2 gap-3 mb-4">
-          <div className="border border-[#CFEBD8] bg-[#F1FAF4] rounded-xl p-3">
+          <div className="border border-[#CFEBD8] bg-[#F1FAF4] rounded-xl p-3" style={!canIn ? { opacity: 0.5 } : {}}>
             <label className="text-xs font-semibold text-[#1B9C4B]">Stock IN (restock)</label>
             <div className="flex gap-2 mt-2">
-              <input type="number" min="1" inputMode="numeric" value={inAmt} onChange={(e) => setInAmt(e.target.value)} onKeyDown={(e) => e.key === "Enter" && applyIn()} placeholder="0" className="w-full border border-[#CFEBD8] rounded-lg px-2 py-1.5 text-sm" />
-              <button type="button" onClick={applyIn} className="px-3 rounded-lg bg-[#1B9C4B] text-white text-xs font-semibold shrink-0">Add</button>
+              <input type="number" min="1" inputMode="numeric" value={inAmt} onChange={(e) => setInAmt(e.target.value)} onKeyDown={(e) => e.key === "Enter" && applyIn()} placeholder="0" disabled={!canIn} className="w-full border border-[#CFEBD8] rounded-lg px-2 py-1.5 text-sm disabled:bg-white" />
+              <button type="button" onClick={applyIn} disabled={!canIn} className="px-3 rounded-lg bg-[#1B9C4B] text-white text-xs font-semibold shrink-0 disabled:opacity-60">Add</button>
             </div>
-            <p className="text-[10px] text-[#1B9C4B] mt-1">Saves immediately</p>
+            <p className="text-[10px] text-[#1B9C4B] mt-1">{canIn ? "Saves immediately" : "Turned off for your account"}</p>
           </div>
-          <div className="border border-[#F5D2CF] bg-[#FDF1F0] rounded-xl p-3">
+          <div className="border border-[#F5D2CF] bg-[#FDF1F0] rounded-xl p-3" style={!canOut ? { opacity: 0.5 } : {}}>
             <label className="text-xs font-semibold text-[#C42E27]">Stock OUT (sold/used)</label>
             <div className="flex gap-2 mt-2">
-              <input type="number" min="1" inputMode="numeric" value={outAmt} onChange={(e) => setOutAmt(e.target.value)} onKeyDown={(e) => e.key === "Enter" && applyOut()} placeholder="0" className="w-full border border-[#F5D2CF] rounded-lg px-2 py-1.5 text-sm" />
-              <button type="button" onClick={applyOut} className="px-3 rounded-lg bg-[#C42E27] text-white text-xs font-semibold shrink-0">Remove</button>
+              <input type="number" min="1" inputMode="numeric" value={outAmt} onChange={(e) => setOutAmt(e.target.value)} onKeyDown={(e) => e.key === "Enter" && applyOut()} placeholder="0" disabled={!canOut} className="w-full border border-[#F5D2CF] rounded-lg px-2 py-1.5 text-sm disabled:bg-white" />
+              <button type="button" onClick={applyOut} disabled={!canOut} className="px-3 rounded-lg bg-[#C42E27] text-white text-xs font-semibold shrink-0 disabled:opacity-60">Remove</button>
             </div>
-            <p className="text-[10px] text-[#C42E27] mt-1">Saves immediately</p>
+            <p className="text-[10px] text-[#C42E27] mt-1">{canOut ? "Saves immediately" : "Turned off for your account"}</p>
           </div>
         </div>
+
 
         <div className="grid grid-cols-2 gap-3 mb-4">
           <div>
@@ -1060,7 +1119,7 @@ function BinCard({ shop, cat, item, updateShop, logActivity, actingAs, onClose, 
           <div className="space-y-1.5 max-h-40 overflow-y-auto">
             {(item.history || []).slice(0, 12).map((h, i) => (
               <div key={h.id || i} className="flex items-center justify-between text-xs py-1 border-b border-[#F1F3F6] last:border-0">
-                <span className={`font-semibold ${h.qtyChange > 0 ? "text-[#1B9C4B]" : "text-[#C42E27]"}`}>{h.qtyChange > 0 ? "+" : ""}{h.qtyChange} {h.type}</span>
+                <span className={`font-semibold ${h.type === "IN" ? "text-[#1B9C4B]" : "text-[#C42E27]"}`}>{h.qtyChange > 0 ? "+" : ""}{h.qtyChange} {h.type}</span>
                 <span className="text-[#9CA3AF]">{h.actingAs}</span>
                 <span className="text-[#9CA3AF]">{fmtDate(h.ts)}</span>
               </div>
@@ -1244,12 +1303,18 @@ function ResellersPanel({ shop, updateShop, showToast }) {
   function addRep() {
     if (!form.name.trim() || !form.email.trim()) return;
     const code = genCode();
-    const rep = { id: uid(), ...form, code, activated: false, addedAt: now() };
+    const rep = { id: uid(), ...form, code, activated: false, addedAt: now(), permissions: { ...DEFAULT_PERMS } };
     updateShop(shop.id, (s) => ({ ...s, reps: [...s.reps, rep] }));
     setShowAdd(false); setForm({ name: "", phone: "", shopAddress: "", email: "" });
     showToast(`${rep.name} added — share their connection code`);
   }
   function copyCode(rep) { copyText(rep.code, showToast); }
+  function togglePermission(rep, key) {
+    updateShop(shop.id, (s) => ({
+      ...s,
+      reps: s.reps.map((r) => r.id !== rep.id ? r : { ...r, permissions: { ...repPerms(r), [key]: !repPerms(r)[key] } }),
+    }));
+  }
 
   return (
     <div>
@@ -1263,7 +1328,9 @@ function ResellersPanel({ shop, updateShop, showToast }) {
         </div>
       ) : (
         <div className="space-y-2">
-          {shop.reps.map((r) => (
+          {shop.reps.map((r) => {
+            const perms = repPerms(r);
+            return (
             <div key={r.id} className="bg-white border border-[#E4E7EC] rounded-xl p-3">
               <div className="flex items-start justify-between">
                 <div>
@@ -1273,12 +1340,21 @@ function ResellersPanel({ shop, updateShop, showToast }) {
                 </div>
                 <button onClick={() => setDel(r)} className="text-[#9CA3AF]"><Trash2 size={14} /></button>
               </div>
-              <div className="flex items-center gap-2 mt-2">
+              <div className="flex items-center gap-2 mt-2 flex-wrap">
                 <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full" style={r.activated ? { background: "#E7F8ED", color: "#1B9C4B" } : { background: BLUE_BG, color: BLUE }}>{r.activated ? "Active reseller" : "Awaiting signup"}</span>
                 {!r.activated && <button onClick={() => copyCode(r)} className="text-xs font-mono font-bold flex items-center gap-1 px-2 py-0.5 rounded-md bg-[#F5F7FA]" style={{ color: BLUE }}><Copy size={11} /> {r.code}</button>}
               </div>
+              <p className="text-[10px] font-semibold text-[#9CA3AF] mt-3 mb-1.5">Permissions</p>
+              <div className="flex items-center gap-2 flex-wrap">
+                <button onClick={() => togglePermission(r, "canStockIn")} className="text-[10px] font-semibold px-2.5 py-1 rounded-full flex items-center gap-1" style={perms.canStockIn ? { background: "#E7F8ED", color: "#1B9C4B" } : { background: "#FDEAEA", color: "#C42E27" }}>
+                  {perms.canStockIn ? <Check size={9} /> : <XIcon size={9} />} Can restock (IN)
+                </button>
+                <button onClick={() => togglePermission(r, "canStockOut")} className="text-[10px] font-semibold px-2.5 py-1 rounded-full flex items-center gap-1" style={perms.canStockOut ? { background: "#E7F8ED", color: "#1B9C4B" } : { background: "#FDEAEA", color: "#C42E27" }}>
+                  {perms.canStockOut ? <Check size={9} /> : <XIcon size={9} />} Can record sales (OUT)
+                </button>
+              </div>
             </div>
-          ))}
+          );})}
         </div>
       )}
       {showAdd && (
@@ -1331,13 +1407,17 @@ function ActivityPanel({ shop, showToast }) {
     <div>
       <SectionHeader title="Activity Log" subtitle="All stock changes for this shop, most recent first" action={<PillButton icon={Download} variant="outline" onClick={downloadActivityLog}>Download</PillButton>} />
       <div className="space-y-1.5 max-h-96 overflow-y-auto">
-        {(shop.activityLog || []).map((a) => (
+        {(shop.activityLog || []).map((a) => {
+          const isIncrease = a.action.toLowerCase().includes("increased");
+          const isDecrease = a.action.toLowerCase().includes("decreased");
+          const color = isIncrease ? "#1B9C4B" : isDecrease ? "#C42E27" : "#111827";
+          return (
           <div key={a.id} className="bg-white border border-[#E4E7EC] rounded-xl px-3 py-2 text-xs">
-            <div className="flex justify-between"><span className="font-semibold text-[#111827]">{a.action}</span><span className="text-[#9CA3AF]">{fmtDate(a.ts)}</span></div>
+            <div className="flex justify-between"><span className="font-semibold" style={{ color }}>{a.action}</span><span className="text-[#9CA3AF]">{fmtDate(a.ts)}</span></div>
             <div className="text-[#6B7280] mt-0.5">{a.details}</div>
             <div className="text-[#C9CDD6] mt-0.5">by {a.actingAs}</div>
           </div>
-        ))}
+        );})}
         {(!shop.activityLog || shop.activityLog.length === 0) && <div className="bg-white border border-[#E4E7EC] rounded-2xl py-8 text-center"><p className="text-xs text-[#9CA3AF]">No activity yet.</p></div>}
       </div>
     </div>
@@ -1365,27 +1445,28 @@ function StatementTab({ shop, showToast }) {
   const [start, setStart] = useState(() => presetRange("30").start);
   const [end, setEnd] = useState(() => presetRange("30").end);
   const [email, setEmail] = useState("");
-  const [rows, setRows] = useState(null);
   const notify = showToast || (() => {});
 
   function choosePreset(id) { setPreset(id); if (id !== "custom") { const r = presetRange(id); setStart(r.start); setEnd(r.end); } }
 
-  function buildRows() {
-    if (!start || !end) return;
+  // History is always derived live from the current shop data and date range —
+  // no button press required before it's visible. It also updates automatically
+  // if a reseller records a change elsewhere while you're looking at this tab.
+  const rows = useMemo(() => {
+    if (!start || !end) return [];
     const s = new Date(start).getTime();
     const e = new Date(end).getTime();
     const out = [];
     shop.categories.forEach((cat) => { cat.items.forEach((item) => { (item.history || []).forEach((h) => { const t = new Date(h.ts).getTime(); if (t >= s && t <= e) out.push({ date: fmtDate(h.ts), category: cat.name, item: item.name, type: h.type, change: h.qtyChange, newQty: h.newQty, actingAs: h.actingAs, price: item.price }); }); }); });
-    out.sort((a, b) => new Date(a.date) - new Date(b.date));
-    setRows(out);
-    notify(`${out.length} entries found`);
-  }
+    out.sort((a, b) => new Date(b.date) - new Date(a.date));
+    return out;
+  }, [shop, start, end]);
 
   function csvText() { return toCSV(rows, [{ key: "date", label: "Date" }, { key: "category", label: "Category" }, { key: "item", label: "Item" }, { key: "type", label: "Type" }, { key: "change", label: "Qty Change" }, { key: "newQty", label: "New Qty" }, { key: "actingAs", label: "By" }, { key: "price", label: "Price" }]); }
 
-  async function downloadCSV() { if (!rows?.length) return; const blob = new Blob([csvText()], { type: "text/csv" }); await exportFile(blob, `statement-${shop.name}.csv`, "text/csv", notify); }
+  async function downloadCSV() { if (!rows.length) return; const blob = new Blob([csvText()], { type: "text/csv" }); await exportFile(blob, `statement-${shop.name}.csv`, "text/csv", notify); }
   async function downloadXLSX() {
-    if (!rows?.length) return;
+    if (!rows.length) return;
     const ws = XLSX.utils.json_to_sheet(rows.map((r) => ({ Date: r.date, Category: r.category, Item: r.item, Type: r.type, "Qty Change": r.change, "New Qty": r.newQty, By: r.actingAs, Price: r.price })));
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Statement");
@@ -1394,7 +1475,7 @@ function StatementTab({ shop, showToast }) {
     await exportFile(blob, `statement-${shop.name}.xlsx`, blob.type, notify);
   }
   async function downloadJPEG() {
-    if (!rows?.length) return;
+    if (!rows.length) return;
     const rowH = 24, padTop = 70, colW = [150, 110, 130, 60, 80, 70, 90];
     const canvas = document.createElement("canvas");
     canvas.width = 720; canvas.height = padTop + rowH * (rows.length + 1) + 30;
@@ -1411,68 +1492,76 @@ function StatementTab({ shop, showToast }) {
     y += 8;
     ctx.strokeStyle = "#E4E7EC"; ctx.beginPath(); ctx.moveTo(20, y); ctx.lineTo(700, y); ctx.stroke();
     ctx.font = "10px sans-serif";
-    rows.forEach((r) => { y += rowH; x = 20; const vals = [r.date, r.category, r.item, r.type, String(r.change), String(r.newQty ?? ""), r.actingAs]; vals.forEach((v, i) => { ctx.fillStyle = "#111827"; ctx.fillText(String(v).slice(0, 18), x, y); x += colW[i]; }); });
+    rows.forEach((r) => {
+      y += rowH; x = 20;
+      const vals = [r.date, r.category, r.item, r.type, String(r.change), String(r.newQty ?? ""), r.actingAs];
+      const color = r.type === "IN" ? "#1B9C4B" : "#C42E27";
+      vals.forEach((v, i) => { ctx.fillStyle = (i === 3 || i === 4) ? color : "#111827"; ctx.fillText(String(v).slice(0, 18), x, y); x += colW[i]; });
+    });
     const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.92));
     if (!blob) { notify("Couldn't generate the image."); return; }
     await exportFile(blob, `statement-${shop.name}.jpg`, "image/jpeg", notify);
   }
   function statementHTML() {
-    return `<html><head><title>Statement - ${shop.name}</title><style>body{font-family:sans-serif;padding:24px;color:#111827}h1{font-size:18px}p{color:#6B7280;font-size:12px}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #E4E7EC;font-size:11px}</style></head><body><h1>${shop.name} — Statement</h1><p>${toDDMM(start)} to ${toDDMM(end)}</p><table><thead><tr><th>Date</th><th>Category</th><th>Item</th><th>Type</th><th>Change</th><th>New Qty</th><th>By</th><th>Price</th></tr></thead><tbody>${rows.map((r) => `<tr><td>${r.date}</td><td>${r.category}</td><td>${r.item}</td><td>${r.type}</td><td>${r.change}</td><td>${r.newQty ?? ""}</td><td>${r.actingAs}</td><td>${naira(r.price)}</td></tr>`).join("")}</tbody></table></body></html>`;
+    const rowsHtml = rows.map((r) => {
+      const color = r.type === "IN" ? "#1B9C4B" : "#C42E27";
+      return `<tr><td>${r.date}</td><td>${r.category}</td><td>${r.item}</td><td style="color:${color};font-weight:600">${r.type}</td><td style="color:${color};font-weight:600">${r.change}</td><td>${r.newQty ?? ""}</td><td>${r.actingAs}</td><td>${naira(r.price)}</td></tr>`;
+    }).join("");
+    return `<html><head><title>Statement - ${shop.name}</title><style>body{font-family:sans-serif;padding:24px;color:#111827}h1{font-size:18px}p{color:#6B7280;font-size:12px}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #E4E7EC;font-size:11px}</style></head><body><h1>${shop.name} — Statement</h1><p>${toDDMM(start)} to ${toDDMM(end)}</p><table><thead><tr><th>Date</th><th>Category</th><th>Item</th><th>Type</th><th>Change</th><th>New Qty</th><th>By</th><th>Price</th></tr></thead><tbody>${rowsHtml}</tbody></table></body></html>`;
   }
   async function downloadPDF() {
-    if (!rows?.length) return;
+    if (!rows.length) return;
     const html = statementHTML();
     let opened = null;
     try { opened = window.open("", "_blank"); } catch (e) { opened = null; }
     if (opened) { opened.document.write(html); opened.document.close(); notify("Opened a printable page — use Print › Save as PDF"); setTimeout(() => { try { opened.print(); } catch (e) {} }, 300); }
     else { const blob = new Blob([html], { type: "text/html" }); await exportFile(blob, `statement-${shop.name}.html`, "text/html", notify); notify("Saved as a printable page — open it and use Print › Save as PDF"); }
   }
-  async function copyCSV() { if (!rows?.length) return; await copyText(csvText(), notify); }
+  async function copyCSV() { if (!rows.length) return; await copyText(csvText(), notify); }
 
   return (
     <div className="space-y-5">
-      <SectionHeader avatarText={AVATAR_INITIALS} title="Statement" subtitle="Generate & download reports" />
+      <SectionHeader avatarText={AVATAR_INITIALS} title="History & Statement" subtitle="Updates live — no need to generate anything first" />
       <div className="bg-white border border-[#E4E7EC] rounded-2xl p-4">
         <label className="text-xs font-semibold text-[#374151] mb-2 block">Date range</label>
         <div className="flex flex-wrap gap-2 mb-3">
           {PRESETS.map((p) => <button key={p.id} onClick={() => choosePreset(p.id)} className="px-3.5 py-2 rounded-xl text-sm font-medium" style={preset === p.id ? { background: BLUE, color: "white" } : { background: "#F1F3F6", color: "#374151" }}>{p.label}</button>)}
         </div>
-        <div className="flex items-center gap-2 mb-4">
+        <div className="flex items-center gap-2">
           <div className="flex-1"><input type="datetime-local" value={start} disabled={preset !== "custom"} onChange={(e) => setStart(e.target.value)} className="w-full border border-[#E4E7EC] rounded-xl px-3 py-2.5 text-sm disabled:bg-[#F5F7FA] disabled:text-[#6B7280]" /></div>
           <span className="text-[#9CA3AF] text-sm">to</span>
           <div className="flex-1"><input type="datetime-local" value={end} disabled={preset !== "custom"} onChange={(e) => setEnd(e.target.value)} className="w-full border border-[#E4E7EC] rounded-xl px-3 py-2.5 text-sm disabled:bg-[#F5F7FA] disabled:text-[#6B7280]" /></div>
         </div>
-        <button onClick={buildRows} style={{ background: BLUE }} className="w-full py-3 rounded-xl text-white text-sm font-semibold flex items-center justify-center gap-2"><ActivityIcon size={15} /> Generate Statement</button>
       </div>
 
-      {rows && (
-        <div className="bg-white border border-[#E4E7EC] rounded-2xl p-4">
-          <div className="flex items-center justify-between mb-3"><h4 className="font-semibold text-[#111827] text-sm">{rows.length} entries found</h4></div>
-          <div className="grid grid-cols-2 gap-2 mb-2">
-            <button onClick={downloadCSV} disabled={!rows.length} className="py-2 rounded-lg border border-[#E4E7EC] text-xs font-medium flex items-center justify-center gap-1 disabled:opacity-40"><Download size={12} /> CSV</button>
-            <button onClick={downloadXLSX} disabled={!rows.length} className="py-2 rounded-lg border border-[#E4E7EC] text-xs font-medium flex items-center justify-center gap-1 disabled:opacity-40"><Download size={12} /> Excel</button>
-            <button onClick={downloadJPEG} disabled={!rows.length} className="py-2 rounded-lg border border-[#E4E7EC] text-xs font-medium flex items-center justify-center gap-1 disabled:opacity-40"><Download size={12} /> JPEG</button>
-            <button onClick={downloadPDF} disabled={!rows.length} className="py-2 rounded-lg border border-[#E4E7EC] text-xs font-medium flex items-center justify-center gap-1 disabled:opacity-40"><Download size={12} /> PDF</button>
-          </div>
-          <button onClick={copyCSV} disabled={!rows.length} className="w-full py-2 rounded-lg text-xs font-medium flex items-center justify-center gap-1 disabled:opacity-40" style={{ color: BLUE }}><Copy size={12} /> Copy as text (works even if downloads don't)</button>
-          <div className="max-h-56 overflow-y-auto text-xs mt-3">
-            {rows.map((r, i) => (
-              <div key={i} className="flex justify-between py-1.5 border-b border-[#F1F3F6]">
-                <span className="text-[#111827]">{r.item}</span>
-                <span className={r.change > 0 ? "text-[#1B9C4B]" : "text-[#C42E27]"}>{r.change > 0 ? "+" : ""}{r.change}</span>
-                <span className="text-[#9CA3AF]">{r.date}</span>
-              </div>
-            ))}
-            {rows.length === 0 && <p className="text-[#9CA3AF]">No activity in this range.</p>}
-          </div>
+      <div className="bg-white border border-[#E4E7EC] rounded-2xl p-4">
+        <div className="flex items-center justify-between mb-3"><h4 className="font-semibold text-[#111827] text-sm">{rows.length} {rows.length === 1 ? "entry" : "entries"}</h4></div>
+        <div className="grid grid-cols-2 gap-2 mb-2">
+          <button onClick={downloadCSV} disabled={!rows.length} className="py-2 rounded-lg border border-[#E4E7EC] text-xs font-medium flex items-center justify-center gap-1 disabled:opacity-40"><Download size={12} /> CSV</button>
+          <button onClick={downloadXLSX} disabled={!rows.length} className="py-2 rounded-lg border border-[#E4E7EC] text-xs font-medium flex items-center justify-center gap-1 disabled:opacity-40"><Download size={12} /> Excel</button>
+          <button onClick={downloadJPEG} disabled={!rows.length} className="py-2 rounded-lg border border-[#E4E7EC] text-xs font-medium flex items-center justify-center gap-1 disabled:opacity-40"><Download size={12} /> JPEG</button>
+          <button onClick={downloadPDF} disabled={!rows.length} className="py-2 rounded-lg border border-[#E4E7EC] text-xs font-medium flex items-center justify-center gap-1 disabled:opacity-40"><Download size={12} /> PDF</button>
         </div>
-      )}
+        <button onClick={copyCSV} disabled={!rows.length} className="w-full py-2 rounded-lg text-xs font-medium flex items-center justify-center gap-1 disabled:opacity-40" style={{ color: BLUE }}><Copy size={12} /> Copy as text (works even if downloads don't)</button>
+        <div className="max-h-72 overflow-y-auto text-xs mt-3">
+          {rows.map((r, i) => (
+            <div key={i} className="flex items-center justify-between py-2 border-b border-[#F1F3F6] gap-2">
+              <div className="min-w-0">
+                <div className="text-[#111827] font-medium truncate">{r.item}</div>
+                <div className="text-[#9CA3AF] text-[10px]">{r.date} · {r.actingAs}</div>
+              </div>
+              <span className="font-bold shrink-0" style={{ color: r.type === "IN" ? "#1B9C4B" : "#C42E27" }}>{r.change > 0 ? "+" : ""}{r.change} {r.type}</span>
+            </div>
+          ))}
+          {rows.length === 0 && <p className="text-[#9CA3AF] py-2">No activity in this range.</p>}
+        </div>
+      </div>
 
       <div className="bg-white border border-[#E4E7EC] rounded-2xl p-4">
         <div className="flex items-center gap-2 mb-1"><Mail size={15} style={{ color: BLUE }} /><h3 className="font-bold text-[#111827] text-sm">Email Statement</h3></div>
         <p className="text-xs text-[#9CA3AF] mb-3">This app has no email server of its own, so this downloads a CSV you can attach to an email yourself.</p>
         <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="owner@example.com" className="w-full border border-[#E4E7EC] rounded-xl px-3 py-2.5 text-sm mb-3" />
-        <button disabled={!email.trim() || !rows} onClick={downloadCSV} style={{ background: BLUE }} className="w-full py-2.5 rounded-xl text-white text-sm font-semibold disabled:opacity-40">Prepare CSV to attach</button>
+        <button disabled={!email.trim() || !rows.length} onClick={downloadCSV} style={{ background: BLUE }} className="w-full py-2.5 rounded-xl text-white text-sm font-semibold disabled:opacity-40">Prepare CSV to attach</button>
       </div>
     </div>
   );
@@ -1482,4 +1571,3 @@ function StatementTab({ shop, showToast }) {
 // Mount
 // ============================================================
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
-
