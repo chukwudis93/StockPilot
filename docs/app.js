@@ -738,21 +738,22 @@ function TopBar({ shops, activeShopId, setActiveShopId, createShop, removeShop, 
         <PillButton icon={Plus} variant="soft" onClick={() => { setShowAdd(true); setName(""); }}>Shop</PillButton>
       </div>
 
-      <div className="flex items-center gap-2 overflow-x-auto -mx-1 px-1 pb-1">
-        {shops.map((s) => (
-          <button key={s.id} onClick={() => setActiveShopId(s.id)} className="shrink-0 px-3.5 py-1.5 rounded-full text-sm font-semibold whitespace-nowrap" style={s.id === activeShopId ? { background: BLUE, color: "white" } : { background: "#F1F3F6", color: "#6B7280" }}>{s.name}</button>
-        ))}
+      <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 overflow-x-auto -mx-1 px-1 pb-1 flex-1 min-w-0">
+          {shops.map((s) => (
+            <button key={s.id} onClick={() => setActiveShopId(s.id)} className="shrink-0 px-3.5 py-1.5 rounded-full text-sm font-semibold whitespace-nowrap" style={s.id === activeShopId ? { background: BLUE, color: "white" } : { background: "#F1F3F6", color: "#6B7280" }}>{s.name}</button>
+          ))}
+        </div>
         <div className="relative shrink-0">
           <button onClick={() => setMenuOpen((o) => !o)} className="w-8 h-8 rounded-full bg-[#F1F3F6] flex items-center justify-center text-[#6B7280]"><MoreVertical size={15} /></button>
           {menuOpen && (
-            <div className="absolute right-0 top-9 bg-white border border-[#E4E7EC] rounded-xl shadow-lg py-1 w-40 z-20">
+            <div className="absolute right-0 top-9 bg-white border border-[#E4E7EC] rounded-xl shadow-lg py-1 w-40 z-30">
               <button onClick={() => { setShowRename(activeShop); setName(activeShop.name); setMenuOpen(false); }} className="w-full text-left px-3 py-2 text-sm text-[#374151] flex items-center gap-2"><Edit2 size={13} /> Rename shop</button>
               {shops.length > 1 && <button onClick={() => { setShowDelete(activeShop); setMenuOpen(false); }} className="w-full text-left px-3 py-2 text-sm text-[#C42E27] flex items-center gap-2"><Trash2 size={13} /> Delete shop</button>}
             </div>
           )}
         </div>
       </div>
-
       <div className="flex items-center gap-2 mt-3">
         <span className="text-xs text-[#9CA3AF]">Acting as</span>
         <select value={actingAs} onChange={(e) => setActingAs(e.target.value)} className="text-xs font-semibold bg-[#F1F3F6] rounded-lg px-2 py-1 text-[#374151] border-none">
