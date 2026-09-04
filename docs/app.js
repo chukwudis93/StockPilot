@@ -339,42 +339,48 @@ function App() {
   const [showResellerAuth, setShowResellerAuth] = useState(false);
   const [showApiKeyModal, setShowApiKeyModal] = useState(false);
   const [syncStatus, setSyncStatus] = useState("connecting"); // connecting | live | local-only | offline
+  const [authUser, setAuthUser] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [lastSyncError, setLastSyncError] = useState(null);
 
   function setActiveShopId(id) {
     setActiveShopIdState(id);
     if (id) localStorage.setItem(ACTIVE_SHOP_KEY, id);
   }
 
-  // ---- Firestore wiring: one collection, "shops", one doc per shop ----
+  // ---- Firestore + Auth wiring ----
+  // We check the CURRENT auth state first (Firebase persists sign-in across
+  // reloads by default). Only if nobody is signed in yet do we fall back to
+  // anonymous auth — this is what lets a shop owner's Google sign-in survive
+  // reloads instead of getting silently replaced every time the app opens.
   useEffect(() => {
     initFirebase();
     if (!firebaseReady) {
-      // No Firebase config yet — fall back to a single local-only shop so the
-      // app is still usable while you finish the Firebase setup steps.
       setSyncStatus("local-only");
       const s = defaultShop("My Shop");
       setShops([s]);
       setActiveShopIdState(localStorage.getItem(ACTIVE_SHOP_KEY) || s.id);
+      setAuthChecked(true);
       return;
     }
 
-    let unsubSnapshot = () => {};
-    firebase.auth().signInAnonymously().catch((e) => {
-      console.error("Firebase auth failed", e);
-      setSyncStatus("offline");
+    firebase.auth().getRedirectResult().catch((e) => {
+      console.error("Google sign-in failed", e);
+      showToast("Google sign-in failed — please try again");
     });
 
+    let unsubSnapshot = () => {};
     const unsubAuth = firebase.auth().onAuthStateChanged((user) => {
-      if (!user) return;
+      setAuthUser(user);
+      setAuthChecked(true);
       unsubSnapshot();
+      if (!user) {
+        firebase.auth().signInAnonymously().catch(() => setSyncStatus("offline"));
+        return;
+      }
       unsubSnapshot = db.collection("shops").onSnapshot(
         (snap) => {
           const list = snap.docs.map((d) => d.data());
-          if (list.length === 0) {
-            const s = defaultShop("My Shop");
-            db.collection("shops").doc(s.id).set(s).catch(() => {});
-            return; // the snapshot listener will fire again once this write lands
-          }
           setShops(list);
           setSyncStatus("live");
           setActiveShopIdState((prev) => {
@@ -398,8 +404,9 @@ function App() {
   }
 
   function createShop(shop) {
-    if (!firebaseReady) { setShops((prev) => [...prev, shop]); return; }
-    db.collection("shops").doc(shop.id).set(shop).catch(() => showToast("Couldn't sync — will retry when back online"));
+    const withOwner = authUser && !authUser.isAnonymous ? { ...shop, ownerId: authUser.uid } : shop;
+    if (!firebaseReady) { setShops((prev) => [...prev, withOwner]); return; }
+    db.collection("shops").doc(withOwner.id).set(withOwner).catch(() => showToast("Couldn't sync — will retry when back online"));
   }
   function removeShop(id) {
     if (!firebaseReady) { setShops((prev) => prev.filter((s) => s.id !== id)); return; }
@@ -425,6 +432,8 @@ function App() {
         tx.set(ref, next);
       });
     } catch (e) {
+      console.error("updateShop failed", e);
+      setLastSyncError((e && e.message) || String(e));
       showToast("Couldn't sync — will retry when back online");
     }
   }
@@ -441,25 +450,60 @@ function App() {
     setSession(null);
     storage.delete(SESSION_KEY).catch(() => {});
   }
+  function signInWithGoogle() {
+    try {
+      const provider = new firebase.auth.GoogleAuthProvider();
+      firebase.auth().signInWithRedirect(provider);
+    } catch (e) {
+      showToast("Google sign-in isn't available right now");
+    }
+  }
+  function signOutOwner() {
+    firebase.auth().signOut().catch(() => {});
+  }
 
   useEffect(() => { (async () => { try { const res2 = await storage.get(SESSION_KEY); setSession(JSON.parse(res2.value)); } catch {} })(); }, []);
 
-  const activeShop = shops?.find((s) => s.id === activeShopId) || null;
+  const isOwner = !!(authUser && !authUser.isAnonymous);
+
+  // One-time claim: if this owner has no shops of their own yet, but there
+  // are legacy shops with no ownerId at all (from before accounts existed),
+  // attach them to whoever signs in first.
+  useEffect(() => {
+    if (!isOwner || !shops) return;
+    const trulyMine = shops.filter((s) => s.ownerId === authUser.uid);
+    if (trulyMine.length > 0) return;
+    const orphans = shops.filter((s) => !s.ownerId);
+    orphans.forEach((s) => updateShop(s.id, (sh) => ({ ...sh, ownerId: authUser.uid })));
+  }, [isOwner, shops]);
+
+  const myShops = isOwner && shops ? shops.filter((s) => !s.ownerId || s.ownerId === authUser.uid) : [];
+
+  const activeShop = myShops.find((s) => s.id === activeShopId) || null;
   const repNames = activeShop ? activeShop.reps.filter((r) => r.activated).map((r) => r.name) : [];
   const actingOptions = ["Owner", ...repNames];
   useEffect(() => { if (!actingOptions.includes(actingAs)) setActingAs("Owner"); }, [activeShopId]);
 
-  if (!shops) {
-    return <div className="min-h-screen flex items-center justify-center bg-[#F5F7FA] text-[#6B7280]">Loading your shops…</div>;
+  if (!authChecked || !shops) {
+    return <div className="min-h-screen flex items-center justify-center bg-[#F5F7FA] text-[#6B7280]">Loading…</div>;
   }
 
   if (session) {
     const shop = shops.find((s) => s.id === session.shopId);
     const rep = shop?.reps.find((r) => r.id === session.repId);
     if (shop && rep) {
-      return <ResellerView shop={shop} rep={rep} updateShop={updateShop} logActivity={logActivity} onLogout={logout} showToast={showToast} />;
+      return <ResellerView shop={shop} rep={rep} updateShop={updateShop} logActivity={logActivity} onLogout={logout} showToast={showToast} lastSyncError={lastSyncError} clearSyncError={() => setLastSyncError(null)} />;
     }
     logout();
+  }
+
+  if (!isOwner) {
+    return (
+      <>
+        <LandingScreen onGoogleSignIn={signInWithGoogle} onResellerClick={() => setShowResellerAuth(true)} />
+        {showResellerAuth && <ResellerAuthModal shops={shops} updateShop={updateShop} onClose={() => setShowResellerAuth(false)} onLoggedIn={(sess) => { loginSession(sess); setShowResellerAuth(false); }} />}
+      </>
+    );
   }
 
   const tabs = [
@@ -470,23 +514,38 @@ function App() {
 
   return (
     <div className="min-h-screen bg-[#F5F7FA] text-[#111827] flex flex-col pb-20" style={{ fontFamily: "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
-      <div className="bg-[#111827] text-center py-1.5 px-4 flex items-center justify-center gap-4">
+      <div className="bg-[#111827] text-center py-1.5 px-4 flex items-center justify-center gap-4 flex-wrap">
         <span className="text-[11px] font-medium flex items-center gap-1" style={{ color: syncStatus === "live" ? "#7BE0A0" : syncStatus === "offline" ? "#F5A3A0" : "#C7D2FE" }}>
           <span style={{ width: 6, height: 6, borderRadius: 999, background: "currentColor", display: "inline-block" }} />
           {syncStatus === "live" ? "Synced live" : syncStatus === "offline" ? "Offline — will resync" : syncStatus === "local-only" ? "Local only (add Firebase config)" : "Connecting…"}
         </span>
         <button onClick={() => setShowResellerAuth(true)} className="text-[11px] font-medium text-[#C7D2FE] flex items-center gap-1"><KeyRound size={11} /> Reseller sign-in</button>
         <button onClick={() => setShowApiKeyModal(true)} className="text-[11px] font-medium text-[#C7D2FE] flex items-center gap-1"><Settings size={11} /> AI Setup key</button>
+        <button onClick={signOutOwner} className="text-[11px] font-medium text-[#C7D2FE] flex items-center gap-1"><LogOut size={11} /> Sign out</button>
       </div>
 
-      {activeShop && (
+      {lastSyncError && (
+        <div className="bg-[#FDEAEA] text-[#C42E27] text-xs px-4 py-2 flex items-center justify-between gap-2">
+          <span className="truncate">Sync error: {lastSyncError}</span>
+          <button onClick={() => setLastSyncError(null)} className="shrink-0"><XIcon size={12} /></button>
+        </div>
+      )}
+
+      {myShops.length === 0 ? (
+        <div className="flex-1 flex flex-col items-center justify-center px-6 text-center">
+          <div className="w-14 h-14 rounded-2xl flex items-center justify-center mb-4" style={{ background: BLUE_BG }}><Store size={24} style={{ color: BLUE }} /></div>
+          <h2 className="font-bold text-lg text-[#111827] mb-1">Create your first shop</h2>
+          <p className="text-sm text-[#6B7280] mb-4 max-w-xs">You're signed in as {authUser.displayName || authUser.email}. Create a shop to get started.</p>
+          <button onClick={() => { const s = defaultShop("My Shop"); createShop(s); setActiveShopId(s.id); }} style={{ background: BLUE }} className="px-5 py-2.5 rounded-xl text-white text-sm font-semibold">Create Shop</button>
+        </div>
+      ) : (
         <>
           {tab === "inventory" && (
-            <TopBar shops={shops} activeShopId={activeShopId} setActiveShopId={setActiveShopId} createShop={createShop} removeShop={removeShop} updateShop={updateShop} showToast={showToast} actingAs={actingAs} setActingAs={setActingAs} actingOptions={actingOptions} />
+            <TopBar shops={myShops} activeShopId={activeShopId} setActiveShopId={setActiveShopId} createShop={createShop} removeShop={removeShop} updateShop={updateShop} showToast={showToast} actingAs={actingAs} setActingAs={setActingAs} actingOptions={actingOptions} />
           )}
           <main className="flex-1 px-4 py-4">
             {tab === "inventory" && (
-              <InventoryTab shop={activeShop} updateShop={updateShop} logActivity={logActivity} actingAs={actingAs} shops={shops} createShop={createShop} setActiveShopId={setActiveShopId} showToast={showToast} />
+              <InventoryTab shop={activeShop} updateShop={updateShop} logActivity={logActivity} actingAs={actingAs} shops={myShops} createShop={createShop} setActiveShopId={setActiveShopId} showToast={showToast} />
             )}
             {tab === "statement" && <StatementTab shop={activeShop} showToast={showToast} />}
             {tab === "admin" && <AdminTab shop={activeShop} updateShop={updateShop} showToast={showToast} />}
@@ -496,23 +555,51 @@ function App() {
 
       {toast && <div className="fixed bottom-20 left-1/2 -translate-x-1/2 bg-[#111827] text-white text-sm px-4 py-2.5 rounded-full shadow-lg z-50">{toast}</div>}
 
-      <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-[#E4E7EC] flex items-stretch z-40" style={{ paddingBottom: "env(safe-area-inset-bottom)" }}>
-        {tabs.map((t) => {
-          const active = tab === t.id;
-          return (
-            <button key={t.id} onClick={() => setTab(t.id)} className="flex-1 flex flex-col items-center gap-1 py-2.5">
-              <t.icon size={20} style={{ color: active ? BLUE : "#9CA3AF" }} />
-              <span className="text-[11px] font-medium" style={{ color: active ? BLUE : "#9CA3AF" }}>{t.label}</span>
-            </button>
-          );
-        })}
-      </nav>
+      {myShops.length > 0 && (
+        <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-[#E4E7EC] flex items-stretch z-40" style={{ paddingBottom: "env(safe-area-inset-bottom)" }}>
+          {tabs.map((t) => {
+            const active = tab === t.id;
+            return (
+              <button key={t.id} onClick={() => setTab(t.id)} className="flex-1 flex flex-col items-center gap-1 py-2.5">
+                <t.icon size={20} style={{ color: active ? BLUE : "#9CA3AF" }} />
+                <span className="text-[11px] font-medium" style={{ color: active ? BLUE : "#9CA3AF" }}>{t.label}</span>
+              </button>
+            );
+          })}
+        </nav>
+      )}
 
       {showResellerAuth && <ResellerAuthModal shops={shops} updateShop={updateShop} onClose={() => setShowResellerAuth(false)} onLoggedIn={(sess) => { loginSession(sess); setShowResellerAuth(false); }} />}
       {showApiKeyModal && <ApiKeyModal onClose={() => setShowApiKeyModal(false)} showToast={showToast} />}
     </div>
   );
 }
+
+function LandingScreen({ onGoogleSignIn, onResellerClick }) {
+  return (
+    <div className="min-h-screen bg-[#F5F7FA] flex flex-col items-center justify-center px-6 text-center">
+      <div className="w-16 h-16 rounded-2xl flex items-center justify-center mb-4" style={{ background: BLUE }}>
+        <Store size={28} className="text-white" />
+      </div>
+      <h1 className="font-bold text-2xl text-[#111827] mb-1">{APP_NAME}</h1>
+      <p className="text-sm text-[#6B7280] mb-8">Shop inventory, synced across your team.</p>
+      <button onClick={onGoogleSignIn} className="w-full max-w-xs py-3 rounded-xl bg-white border border-[#E4E7EC] text-[#111827] font-semibold text-sm flex items-center justify-center gap-2 mb-3 shadow-sm">
+        <svg width="18" height="18" viewBox="0 0 48 48">
+          <path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.6 29.3 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.9 1.2 8 3.1l6-6C34.5 5.1 29.5 3 24 3 12.4 3 3 12.4 3 24s9.4 21 21 21 21-9.4 21-21c0-1.4-.1-2.8-.4-4.5z"/>
+          <path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.9 1.2 8 3.1l6-6C34.5 5.1 29.5 3 24 3 16.3 3 9.7 7.3 6.3 14.7z"/>
+          <path fill="#4CAF50" d="M24 45c5.4 0 10.3-1.8 14-5l-6.5-5.4C29.4 36.2 26.9 37 24 37c-5.3 0-9.7-3.4-11.3-8.1l-6.6 5.1C9.6 40.5 16.2 45 24 45z"/>
+          <path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-0.8 2.3-2.3 4.2-4.3 5.6l6.5 5.4C40.9 36.4 44 30.9 44 24c0-1.4-.1-2.8-.4-3.5z"/>
+        </svg>
+        Continue as Shop Owner
+      </button>
+      <button onClick={onResellerClick} className="w-full max-w-xs py-3 rounded-xl text-sm font-semibold flex items-center justify-center gap-2" style={{ background: BLUE_BG, color: BLUE }}>
+        <KeyRound size={16} /> I have a connection code
+      </button>
+      <p className="text-[11px] text-[#9CA3AF] mt-8 max-w-xs">Shop owners sign in with Google and stay signed in until they sign out. Resellers use the code their shop owner gives them.</p>
+    </div>
+  );
+}
+
 
 function ApiKeyModal({ onClose, showToast }) {
   const [key, setKey] = useState("");
@@ -648,12 +735,18 @@ function ResellerAuthModal({ shops, updateShop, onClose, onLoggedIn }) {
   );
 }
 
-function ResellerView({ shop, rep, updateShop, logActivity, onLogout, showToast }) {
+function ResellerView({ shop, rep, updateShop, logActivity, onLogout, showToast, lastSyncError, clearSyncError }) {
   const [tab, setTab] = useState("inventory");
   const permissions = repPerms(rep);
   const tabs = [{ id: "inventory", label: "Inventory", icon: Store }, { id: "statement", label: "Statement", icon: LayoutList }];
   return (
     <div className="min-h-screen bg-[#F5F7FA] text-[#111827] flex flex-col pb-20" style={{ fontFamily: "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
+      {lastSyncError && (
+        <div className="bg-[#FDEAEA] text-[#C42E27] text-xs px-4 py-2 flex items-center justify-between gap-2">
+          <span className="truncate">Sync error: {lastSyncError}</span>
+          <button onClick={clearSyncError} className="shrink-0"><XIcon size={12} /></button>
+        </div>
+      )}
       <div className="bg-white border-b border-[#E4E7EC] px-4 pt-5 pb-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -754,6 +847,7 @@ function TopBar({ shops, activeShopId, setActiveShopId, createShop, removeShop, 
           )}
         </div>
       </div>
+
       <div className="flex items-center gap-2 mt-3">
         <span className="text-xs text-[#9CA3AF]">Acting as</span>
         <select value={actingAs} onChange={(e) => setActingAs(e.target.value)} className="text-xs font-semibold bg-[#F1F3F6] rounded-lg px-2 py-1 text-[#374151] border-none">
