@@ -364,11 +364,6 @@ function App() {
       return;
     }
 
-    firebase.auth().getRedirectResult().catch((e) => {
-      console.error("Google sign-in failed", e);
-      showToast("Google sign-in failed — please try again");
-    });
-
     let unsubSnapshot = () => {};
     const unsubAuth = firebase.auth().onAuthStateChanged((user) => {
       setAuthUser(user);
@@ -451,12 +446,17 @@ function App() {
     storage.delete(SESSION_KEY).catch(() => {});
   }
   function signInWithGoogle() {
-    try {
-      const provider = new firebase.auth.GoogleAuthProvider();
-      firebase.auth().signInWithRedirect(provider);
-    } catch (e) {
-      showToast("Google sign-in isn't available right now");
-    }
+    const provider = new firebase.auth.GoogleAuthProvider();
+    firebase.auth().signInWithPopup(provider).catch((e) => {
+      console.error("Google sign-in failed", e);
+      if (e && e.code === "auth/popup-blocked") {
+        showToast("Your browser blocked the sign-in popup — allow popups for this site and try again");
+      } else if (e && e.code === "auth/popup-closed-by-user") {
+        // user closed it themselves — no error needed
+      } else {
+        showToast("Google sign-in failed — please try again");
+      }
+    });
   }
   function signOutOwner() {
     firebase.auth().signOut().catch(() => {});
